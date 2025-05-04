@@ -12,6 +12,8 @@ import sys
 import random
 import math
 import numpy as np
+import argparse
+from types import SimpleNamespace
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -26,7 +28,6 @@ import torchvision
 import torchvision.utils as vutils
 import torchvision.transforms as transforms
 from torch.nn.functional import adaptive_avg_pool2d
-import argparse
 import scipy
 from scipy import linalg
 from scipy.ndimage import filters as scipy_filters
@@ -47,7 +48,7 @@ except ImportError:
     def tqdm(x): return x
 
 # Initialize device
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if (torch.cuda.is_available() and not torch.cuda.is_initialized()) else "cpu")
 print(f"Using device: {device}")
 
 # Create directories for input/output
@@ -64,17 +65,19 @@ os.makedirs('Output', exist_ok=True)
 class ConvBlock(nn.Sequential):
     def __init__(self, in_channel, out_channel, ker_size, padd, stride):
         super(ConvBlock, self).__init__()
-        self.add_module('conv', nn.Conv2d(in_channel, out_channel, kernel_size=ker_size, stride=stride, padding=padd)),
-        self.add_module('norm', nn.BatchNorm2d(out_channel)),
-        self.add_module('LeakyRelu', nn.LeakyReLU(0.2, inplace=True))
+        self.add_module('conv', nn.Conv2d(in_channel, out_channel, kernel_size=ker_size, stride=stride, padding=padd))
+        self.add_module('norm', nn.BatchNorm2d(out_channel))
+        self.add_module('LeakyRelu', nn.LeakyReLU(0.2, inplace=False))
 
 def weights_init(m):
     classname = m.__class__.__name__
     if classname.find('Conv2d') != -1:
-        m.weight.data.normal_(0.0, 0.02)
+        # Use non-in-place operations for weight initialization
+        m.weight.data = torch.normal(0.0, 0.02, size=m.weight.data.shape, device=m.weight.device)
     elif classname.find('Norm') != -1:
-        m.weight.data.normal_(1.0, 0.02)
-        m.bias.data.fill_(0)
+        # Use non-in-place operations for weight and bias initialization
+        m.weight.data = torch.normal(1.0, 0.02, size=m.weight.data.shape, device=m.weight.device)
+        m.bias.data = torch.zeros_like(m.bias.data)
    
 class WDiscriminator(nn.Module):
     def __init__(self, opt):
@@ -117,7 +120,8 @@ class GeneratorConcatSkip2CleanAdd(nn.Module):
         x = self.tail(x)
         ind = int((y.shape[2]-x.shape[2])/2)
         y = y[:, :, ind:(y.shape[2]-ind), ind:(y.shape[3]-ind)]
-        return x+y
+        # Create a new tensor instead of in-place addition
+        return x + y.clone()
 
 #############################
 # InceptionV3 for SIFID (from SIFID/inception.py)
@@ -275,6 +279,9 @@ def norm(x):
     return out.clamp(-1, 1)
 
 def convert_image_np(inp):
+    # Create a defensive copy to avoid in-place modifications
+    inp = inp.clone().detach()
+    
     if inp.shape[1] == 3:
         inp = denorm(inp)
         inp = inp[-1, :, :, :]
@@ -326,10 +333,15 @@ def reset_grads(model, require_grad):
     return model
 
 def calc_gradient_penalty(netD, real_data, fake_data, LAMBDA, device):
+    # Use detached copies to prevent in-place operations from affecting the computational graph
+    real_data = real_data.detach().clone()
+    fake_data = fake_data.detach().clone()
+    
     alpha = torch.rand(1, 1)
     alpha = alpha.expand(real_data.size())
     alpha = alpha.to(device)
 
+    # Create interpolated images without in-place operations
     interpolates = alpha * real_data + ((1 - alpha) * fake_data)
     interpolates = interpolates.to(device)
     interpolates = torch.autograd.Variable(interpolates, requires_grad=True)
@@ -339,6 +351,8 @@ def calc_gradient_penalty(netD, real_data, fake_data, LAMBDA, device):
     gradients = torch.autograd.grad(outputs=disc_interpolates, inputs=interpolates,
                               grad_outputs=torch.ones(disc_interpolates.size()).to(device),
                               create_graph=True, retain_graph=True, only_inputs=True)[0]
+    
+    # Calculate penalty without in-place operations
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
     return gradient_penalty
 
@@ -357,15 +371,28 @@ def read_image_dir(dir, opt):
 def np2torch(x, opt):
     if opt.nc_im == 3:
         x = x[:, :, :, None]
-        x = x.transpose((3, 2, 0, 1)) / 255
+        x = x.transpose((3, 2, 0, 1))/255
     else:
         x = color.rgb2gray(x)
         x = x[:, :, None, None]
         x = x.transpose(3, 2, 0, 1)
     x = torch.from_numpy(x)
-    if not opt.not_cuda:
-        x = x.to(device)
-    x = x.type(torch.cuda.FloatTensor) if not opt.not_cuda else x.type(torch.FloatTensor)
+    
+    # Check if CUDA is actually available before trying to use it
+    cuda_available = torch.cuda.is_available() and not opt.not_cuda
+    
+    if cuda_available:
+        try:
+            x = x.to(device)
+            x = x.type(torch.cuda.FloatTensor)
+        except RuntimeError:
+            print("Warning: Could not use CUDA. Falling back to CPU.")
+            opt.not_cuda = True
+            cuda_available = False
+    
+    if not cuda_available:
+        x = x.type(torch.FloatTensor)
+    
     x = norm(x)
     return x
 
@@ -387,7 +414,7 @@ def adjust_scales2image(real_, opt):
     scale2stop = math.ceil(math.log(min([opt.max_size, max([real_.shape[2], real_.shape[3]])]) / max([real_.shape[2], real_.shape[3]]), opt.scale_factor_init))
     opt.stop_scale = opt.num_scales - scale2stop
     opt.scale1 = min(opt.max_size / max([real_.shape[2], real_.shape[3]]), 1)
-    real = imresize(real_, opt.scale1, opt)
+    real = imresize(real_, scale_factor=opt.scale1)
     opt.scale_factor = math.pow(opt.min_size/(min(real.shape[2], real.shape[3])), 1/(opt.stop_scale))
     scale2stop = math.ceil(math.log(min([opt.max_size, max([real_.shape[2], real_.shape[3]])]) / max([real_.shape[2], real_.shape[3]]), opt.scale_factor_init))
     opt.stop_scale = opt.num_scales - scale2stop
@@ -399,7 +426,7 @@ def adjust_scales2image_SR(real_, opt):
     scale2stop = int(math.log(min(opt.max_size, max(real_.shape[2], real_.shape[3])) / max(real_.shape[0], real_.shape[3]), opt.scale_factor_init))
     opt.stop_scale = opt.num_scales - scale2stop
     opt.scale1 = min(opt.max_size / max([real_.shape[2], real_.shape[3]]), 1)
-    real = imresize(real_, opt.scale1, opt)
+    real = imresize(real_, scale_factor=opt.scale1)
     opt.scale_factor = math.pow(opt.min_size/(min(real.shape[2], real.shape[3])), 1/(opt.stop_scale))
     scale2stop = int(math.log(min(opt.max_size, max(real_.shape[2], real_.shape[3])) / max(real_.shape[0], real_.shape[3]), opt.scale_factor_init))
     opt.stop_scale = opt.num_scales - scale2stop
@@ -409,7 +436,7 @@ def creat_reals_pyramid(real, reals, opt):
     real = real[:, 0:3, :, :]
     for i in range(0, opt.stop_scale+1, 1):
         scale = math.pow(opt.scale_factor, opt.stop_scale-i)
-        curr_real = imresize(real, scale, opt)
+        curr_real = imresize(real, scale_factor=scale)
         reals.append(curr_real)
     return reals
 
@@ -467,14 +494,29 @@ def generate_dir2save(opt):
 
 def post_config(opt):
     # init fixed parameters
-    opt.device = device
+    cuda_available = torch.cuda.is_available() and not opt.not_cuda
+    if cuda_available:
+        try:
+            # Try a small CUDA operation to verify it works
+            test_tensor = torch.zeros(1).cuda()
+            del test_tensor
+            opt.device = torch.device("cuda:0")
+        except RuntimeError:
+            print("Warning: CUDA initialization failed. Using CPU instead.")
+            opt.device = torch.device("cpu")
+            opt.not_cuda = True
+    else:
+        opt.device = torch.device("cpu")
+        if not opt.not_cuda and not torch.cuda.is_available():
+            print("Warning: CUDA is not available. Using CPU instead.")
+            opt.not_cuda = True
+    
     opt.niter_init = opt.niter
     opt.noise_amp_init = opt.noise_amp
     opt.nfc_init = opt.nfc
     opt.min_nfc_init = opt.min_nfc
     opt.scale_factor_init = opt.scale_factor
     opt.out_ = 'TrainedModels/%s/scale_factor=%f/' % (opt.input_name[:-4], opt.scale_factor)
-    
     if opt.mode == 'SR':
         opt.alpha = 100
 
@@ -483,8 +525,11 @@ def post_config(opt):
     print("Random Seed: ", opt.manualSeed)
     random.seed(opt.manualSeed)
     torch.manual_seed(opt.manualSeed)
-    if torch.cuda.is_available() and opt.not_cuda:
-        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+    
+    # Only show this warning if the user specifically asked for CUDA
+    if not opt.not_cuda and not torch.cuda.is_available():
+        print("WARNING: You specified to use CUDA, but it's not available. Running on CPU instead.")
+    
     return opt
 
 def calc_init_scale(opt):
@@ -542,12 +587,19 @@ def imresize(im, scale_factor=None, output_shape=None, kernel=None, antialiasing
     # First convert to numpy
     im = torch2uint8(im)
     
+    # Check parameters
+    if isinstance(output_shape, argparse.Namespace):
+        # This is likely a mistake - opt is being passed as output_shape
+        # Extract relevant fields or just use scale_factor instead
+        print("Warning: Namespace object detected as output_shape; converting to None")
+        output_shape = None
+    
     # Apply resizing function
     im_resized = imresize_in(im, scale_factor=scale_factor, output_shape=output_shape, 
                              kernel=kernel, antialiasing=antialiasing, kernel_shift_flag=kernel_shift_flag)
     
     # Convert back to torch tensor
-    im_resized = np2torch(im_resized, SimpleNamespace(nc_im=3, not_cuda=False))
+    im_resized = np2torch(im_resized, SimpleNamespace(nc_im=3, not_cuda=not torch.cuda.is_available()))
     return im_resized
 
 def imresize_to_shape(im, output_shape, opt):
@@ -558,6 +610,8 @@ def imresize_to_shape(im, output_shape, opt):
 
 def imresize_in(im, scale_factor=None, output_shape=None, kernel=None, antialiasing=True, kernel_shift_flag=False):
     # First standardize values and fill missing arguments (if needed) by deriving scale from output shape or vice versa
+    if isinstance(output_shape, argparse.Namespace):
+        raise TypeError("output_shape should be a shape tuple/list, not a Namespace object")
     scale_factor, output_shape = fix_scale_and_size(im.shape, output_shape, scale_factor)
 
     # For a given numeric kernel case, just do convolution and sub-sampling (downscaling only)
@@ -773,12 +827,31 @@ from types import SimpleNamespace
 # Training functions (from training.py)
 #############################
 
-def train(opt, Gs, Zs, reals, NoiseAmp):
-    real_ = read_image(opt)
+def train(opt, Gs, Zs, reals, NoiseAmp, real_=None, real=None):
+    """
+    Train the SinGAN model.
+    
+    Args:
+        opt: Options
+        Gs: List of generator networks
+        Zs: List of noise tensors
+        reals: List of real images at different scales
+        NoiseAmp: List of noise amplitudes
+        real_: Original real image (optional, will be read if not provided)
+        real: Processed real image at scale1 (optional, will be processed if not provided)
+    """
+    # Only read the image if not provided
+    if real_ is None:
+        real_ = read_image(opt)
+    
     in_s = 0
     scale_num = 0
-    real = imresize(real_, opt.scale1, opt)
-    reals = creat_reals_pyramid(real, reals, opt)
+    
+    # Only adjust scales and create pyramid if not already done
+    if real is None or len(reals) == 0:
+        real = imresize(real_, scale_factor=opt.scale1)
+        reals = creat_reals_pyramid(real, reals, opt)
+    
     nfc_prev = 0
 
     while scale_num < opt.stop_scale + 1:
@@ -796,8 +869,8 @@ def train(opt, Gs, Zs, reals, NoiseAmp):
 
         D_curr, G_curr = init_models(opt)
         if (nfc_prev == opt.nfc):
-            G_curr.load_state_dict(torch.load('%s/%d/netG.pth' % (opt.out_, scale_num-1), map_location=device))
-            D_curr.load_state_dict(torch.load('%s/%d/netD.pth' % (opt.out_, scale_num-1), map_location=device))
+            G_curr.load_state_dict(torch.load('%s/%d/netG.pth' % (opt.out_, scale_num-1), map_location=opt.device))
+            D_curr.load_state_dict(torch.load('%s/%d/netD.pth' % (opt.out_, scale_num-1), map_location=opt.device))
 
         z_curr, in_s, G_curr = train_single_scale(D_curr, G_curr, reals, Gs, Zs, in_s, NoiseAmp, opt)
 
@@ -821,15 +894,18 @@ def train(opt, Gs, Zs, reals, NoiseAmp):
     return
 
 def train_single_scale(netD, netG, reals, Gs, Zs, in_s, NoiseAmp, opt, centers=None):
+    # Enable anomaly detection to find the gradient issue
+    torch.autograd.set_detect_anomaly(True)
+
     real = reals[len(Gs)]
-    opt.nzx = real.shape[2]
-    opt.nzy = real.shape[3]
-    opt.receptive_field = opt.ker_size + ((opt.ker_size-1)*(opt.num_layer-1))*opt.stride
+    opt.nzx = real.shape[2]  # +(opt.ker_size-1)*(opt.num_layer)
+    opt.nzy = real.shape[3]  # +(opt.ker_size-1)*(opt.num_layer)
+    opt.receptive_field = opt.ker_size + ((opt.ker_size - 1) * (opt.num_layer - 1)) * opt.stride
     pad_noise = int(((opt.ker_size - 1) * opt.num_layer) / 2)
     pad_image = int(((opt.ker_size - 1) * opt.num_layer) / 2)
     if opt.mode == 'animation_train':
-        opt.nzx = real.shape[2]+(opt.ker_size-1)*(opt.num_layer)
-        opt.nzy = real.shape[3]+(opt.ker_size-1)*(opt.num_layer)
+        opt.nzx = real.shape[2] + (opt.ker_size - 1) * (opt.num_layer)
+        opt.nzy = real.shape[3] + (opt.ker_size - 1) * (opt.num_layer)
         pad_noise = 0
     m_noise = nn.ZeroPad2d(int(pad_noise))
     m_image = nn.ZeroPad2d(int(pad_image))
@@ -862,13 +938,16 @@ def train_single_scale(netD, netG, reals, Gs, Zs, in_s, NoiseAmp, opt, centers=N
             noise_ = generate_noise([opt.nc_z, opt.nzx, opt.nzy], device=opt.device)
             noise_ = m_noise(noise_)
 
+        ############################
         # (1) Update D network: maximize D(x) + D(G(z))
+        ###########################
         for j in range(opt.Dsteps):
             # train with real
             netD.zero_grad()
 
             output = netD(real).to(opt.device)
-            errD_real = -output.mean()
+            # D_real_map = output.detach()
+            errD_real = -output.mean()  # -a
             errD_real.backward(retain_graph=True)
             D_x = -errD_real.item()
 
@@ -909,7 +988,11 @@ def train_single_scale(netD, netG, reals, Gs, Zs, in_s, NoiseAmp, opt, centers=N
             else:
                 noise = opt.noise_amp * noise_ + prev
 
-            fake = netG(noise.detach(), prev)
+            # Create a defensive copy of noise and prev to avoid in-place operations
+            noise_copy = noise.clone().detach()
+            prev_copy = prev.clone().detach()
+            
+            fake = netG(noise_copy, prev_copy)
             output = netD(fake.detach())
             errD_fake = output.mean()
             errD_fake.backward(retain_graph=True)
@@ -923,23 +1006,35 @@ def train_single_scale(netD, netG, reals, Gs, Zs, in_s, NoiseAmp, opt, centers=N
 
         errD2plot.append(errD.detach())
 
+        ############################
         # (2) Update G network: maximize D(G(z))
+        ###########################
+
         for j in range(opt.Gsteps):
             netG.zero_grad()
+            
+            # Create defensive copies to avoid in-place operations
+            noise_copy = noise.clone().detach()
+            prev_copy = prev.clone().detach()
+            
+            fake = netG(noise_copy, prev_copy)
             output = netD(fake)
             errG = -output.mean()
             errG.backward(retain_graph=True)
+            
             if alpha != 0:
                 loss = nn.MSELoss()
                 if opt.mode == 'paint_train':
                     z_prev = quant2centers(z_prev, centers)
                     plt.imsave('%s/z_prev.png' % (opt.outf), convert_image_np(z_prev), vmin=0, vmax=1)
-                Z_opt = opt.noise_amp * z_opt + z_prev
-                rec_loss = alpha * loss(netG(Z_opt.detach(), z_prev), real)
+                
+                # Use z_opt (lowercase) consistently
+                z_opt_noise = opt.noise_amp * z_opt + z_prev
+                rec_loss = alpha * loss(netG(z_opt_noise.detach(), z_prev), real)
                 rec_loss.backward(retain_graph=True)
                 rec_loss = rec_loss.detach()
             else:
-                Z_opt = z_opt
+                z_opt_noise = z_opt
                 rec_loss = 0
 
             optimizerG.step()
@@ -949,12 +1044,13 @@ def train_single_scale(netD, netG, reals, Gs, Zs, in_s, NoiseAmp, opt, centers=N
         D_fake2plot.append(D_G_z)
         z_opt2plot.append(rec_loss)
 
-        if epoch % 25 == 0 or epoch == (opt.niter-1):
+        if epoch % 25 == 0 or epoch == (opt.niter - 1):
             print('scale %d:[%d/%d]' % (len(Gs), epoch, opt.niter))
 
-        if epoch % 500 == 0 or epoch == (opt.niter-1):
+        if epoch % 500 == 0 or epoch == (opt.niter - 1):
             plt.imsave('%s/fake_sample.png' % (opt.outf), convert_image_np(fake.detach()), vmin=0, vmax=1)
-            plt.imsave('%s/G(z_opt).png' % (opt.outf), convert_image_np(netG(Z_opt.detach(), z_prev).detach()), vmin=0, vmax=1)
+            # Use z_opt_noise (lowercase) for consistency
+            plt.imsave('%s/G(z_opt).png' % (opt.outf), convert_image_np(netG(z_opt_noise.detach(), z_prev).detach()), vmin=0, vmax=1)
             torch.save(z_opt, '%s/z_opt.pth' % (opt.outf))
 
         schedulerD.step()
@@ -964,7 +1060,7 @@ def train_single_scale(netD, netG, reals, Gs, Zs, in_s, NoiseAmp, opt, centers=N
     return z_opt, in_s, netG
 
 def draw_concat(Gs, Zs, reals, NoiseAmp, in_s, mode, m_noise, m_image, opt):
-    G_z = in_s
+    G_z = in_s.clone()  # Make a clone to avoid in-place operations
     if len(Gs) > 0:
         if mode == 'rand':
             count = 0
@@ -978,21 +1074,21 @@ def draw_concat(Gs, Zs, reals, NoiseAmp, in_s, mode, m_noise, m_image, opt):
                 else:
                     z = generate_noise([opt.nc_z, Z_opt.shape[2] - 2 * pad_noise, Z_opt.shape[3] - 2 * pad_noise], device=opt.device)
                 z = m_noise(z)
-                G_z = G_z[:, :, 0:real_curr.shape[2], 0:real_curr.shape[3]]
-                G_z = m_image(G_z)
-                z_in = noise_amp * z + G_z
-                G_z = G(z_in.detach(), G_z)
-                G_z = imresize(G_z, 1/opt.scale_factor, opt)
+                G_z_curr = G_z[:, :, 0:real_curr.shape[2], 0:real_curr.shape[3]]
+                G_z_curr = m_image(G_z_curr)
+                z_in = noise_amp * z + G_z_curr  # Non-in-place addition
+                G_z = G(z_in.detach(), G_z_curr)
+                G_z = imresize(G_z, scale_factor=1/opt.scale_factor)
                 G_z = G_z[:, :, 0:real_next.shape[2], 0:real_next.shape[3]]
                 count += 1
         if mode == 'rec':
             count = 0
             for G, Z_opt, real_curr, real_next, noise_amp in zip(Gs, Zs, reals, reals[1:], NoiseAmp):
-                G_z = G_z[:, :, 0:real_curr.shape[2], 0:real_curr.shape[3]]
-                G_z = m_image(G_z)
-                z_in = noise_amp * Z_opt + G_z
-                G_z = G(z_in.detach(), G_z)
-                G_z = imresize(G_z, 1/opt.scale_factor, opt)
+                G_z_curr = G_z[:, :, 0:real_curr.shape[2], 0:real_curr.shape[3]]
+                G_z_curr = m_image(G_z_curr)
+                z_in = noise_amp * Z_opt + G_z_curr  # Non-in-place addition
+                G_z = G(z_in.detach(), G_z_curr)
+                G_z = imresize(G_z, scale_factor=1/opt.scale_factor)
                 G_z = G_z[:, :, 0:real_next.shape[2], 0:real_next.shape[3]]
                 count += 1
     return G_z
@@ -1044,20 +1140,26 @@ def train_paint(opt, Gs, Zs, reals, NoiseAmp, centers, paint_inject_scale):
     return
 
 def init_models(opt):
-    # generator initialization
+    # Generator initialization:
     netG = GeneratorConcatSkip2CleanAdd(opt).to(opt.device)
     netG.apply(weights_init)
     if opt.netG != '':
-        netG.load_state_dict(torch.load(opt.netG, map_location=device))
-    print(netG)
-
-    # discriminator initialization
+        netG.load_state_dict(torch.load('%s' % opt.netG, map_location=opt.device))
+    
+    # Discriminator initialization:
     netD = WDiscriminator(opt).to(opt.device)
     netD.apply(weights_init)
     if opt.netD != '':
-        netD.load_state_dict(torch.load(opt.netD, map_location=device))
+        netD.load_state_dict(torch.load('%s' % opt.netD, map_location=opt.device))
+    
+    # Set models to training mode
+    netG.train()
+    netD.train()
+    
+    # Print model architectures
+    print(netG)
     print(netD)
-
+    
     return netD, netG
 
 #############################
@@ -1101,7 +1203,7 @@ def generate_gif(Gs, Zs, reals, NoiseAmp, opt, alpha=0.1, beta=0.9, start_scale=
                 I_prev = in_s
             else:
                 I_prev = images_prev[i]
-                I_prev = imresize(I_prev, 1 / opt.scale_factor, opt)
+                I_prev = imresize(I_prev, scale_factor=1/opt.scale_factor)
                 I_prev = I_prev[:, :, 0:real.shape[2], 0:real.shape[3]]
                 I_prev = m_image(I_prev)
             if count < start_scale:
@@ -1152,7 +1254,7 @@ def SinGAN_generate(Gs, Zs, reals, NoiseAmp, opt, in_s=None, scale_v=1, scale_h=
                 I_prev = m(in_s)
             else:
                 I_prev = images_prev[i]
-                I_prev = imresize(I_prev, 1 / opt.scale_factor, opt)
+                I_prev = imresize(I_prev, scale_factor=1/opt.scale_factor)
                 if opt.mode != "SR":
                     I_prev = I_prev[:, :, 0:round(scale_v * reals[n].shape[2]), 0:round(scale_h * reals[n].shape[3])]
                     I_prev = m(I_prev)
@@ -1180,7 +1282,7 @@ def SinGAN_generate(Gs, Zs, reals, NoiseAmp, opt, in_s=None, scale_v=1, scale_h=
                     plt.imsave('%s/%d.png' % (dir2save, i), convert_image_np(I_curr.detach()), vmin=0, vmax=1)
             images_cur.append(I_curr)
         n += 1
-    return I_curr.detach() 
+    return I_curr.detach()
 
 #############################
 # Main functions for Google Colab
@@ -1418,9 +1520,9 @@ def run_harmonization(opt):
 
             N = len(reals) - 1
             n = opt.harmonization_start_scale
-            in_s = imresize(ref, pow(opt.scale_factor, (N - n + 1)), opt)
+            in_s = imresize(ref, scale_factor=pow(opt.scale_factor, (N - n + 1)))
             in_s = in_s[:, :, :reals[n - 1].shape[2], :reals[n - 1].shape[3]]
-            in_s = imresize(in_s, 1 / opt.scale_factor, opt)
+            in_s = imresize(in_s, scale_factor=1/opt.scale_factor)
             in_s = in_s[:, :, :reals[n].shape[2], :reals[n].shape[3]]
             out = SinGAN_generate(Gs[n:], Zs[n:], reals, NoiseAmp[n:], opt, in_s, n=n, num_samples=1)
             out = (1-mask)*real + mask*out
@@ -1466,9 +1568,9 @@ def run_editing(opt):
 
             N = len(reals) - 1
             n = opt.editing_start_scale
-            in_s = imresize(ref, pow(opt.scale_factor, (N - n + 1)), opt)
+            in_s = imresize(ref, scale_factor=pow(opt.scale_factor, (N - n + 1)))
             in_s = in_s[:, :, :reals[n - 1].shape[2], :reals[n - 1].shape[3]]
-            in_s = imresize(in_s, 1 / opt.scale_factor, opt)
+            in_s = imresize(in_s, scale_factor=1/opt.scale_factor)
             in_s = in_s[:, :, :reals[n].shape[2], :reals[n].shape[3]]
             out = SinGAN_generate(Gs[n:], Zs[n:], reals, NoiseAmp[n:], opt, in_s, n=n, num_samples=1)
             
@@ -1510,16 +1612,16 @@ def run_paint2image(opt):
 
             N = len(reals) - 1
             n = opt.paint_start_scale
-            in_s = imresize(ref, pow(opt.scale_factor, (N - n + 1)), opt)
+            in_s = imresize(ref, scale_factor=pow(opt.scale_factor, (N - n + 1)))
             in_s = in_s[:, :, :reals[n - 1].shape[2], :reals[n - 1].shape[3]]
-            in_s = imresize(in_s, 1 / opt.scale_factor, opt)
+            in_s = imresize(in_s, scale_factor=1/opt.scale_factor)
             in_s = in_s[:, :, :reals[n].shape[2], :reals[n].shape[3]]
             
             if opt.quantization_flag:
                 opt.mode = 'paint_train'
                 dir2trained_model = generate_dir2save(opt)
                 
-                real_s = imresize(real, pow(opt.scale_factor, (N - n)), opt)
+                real_s = imresize(real, scale_factor=pow(opt.scale_factor, (N - n)))
                 real_s = real_s[:, :, :reals[n].shape[2], :reals[n].shape[3]]
                 real_quant, centers = quant(real_s, opt.device)
                 
@@ -1527,7 +1629,7 @@ def run_paint2image(opt):
                 plt.imsave('%s/in_paint.png' % dir2save, convert_image_np(in_s), vmin=0, vmax=1)
                 
                 in_s = quant2centers(ref, centers)
-                in_s = imresize(in_s, pow(opt.scale_factor, (N - n)), opt)
+                in_s = imresize(in_s, scale_factor=pow(opt.scale_factor, (N - n)))
                 in_s = in_s[:, :, :reals[n].shape[2], :reals[n].shape[3]]
                 
                 plt.imsave('%s/in_paint_quant.png' % dir2save, convert_image_np(in_s), vmin=0, vmax=1)
@@ -1590,7 +1692,7 @@ def run_super_resolution(opt):
         opt.scale_factor_init = 1 / in_scale
         
         for j in range(1, iter_num + 1, 1):
-            real_ = imresize(real_, pow(1 / opt.scale_factor, 1), opt)
+            real_ = imresize(real_, scale_factor=pow(1/opt.scale_factor, 1))
             reals_sr.append(real_)
             Gs_sr.append(Gs[-1])
             NoiseAmp_sr.append(NoiseAmp[-1])
@@ -1607,125 +1709,118 @@ def run_super_resolution(opt):
         return dir2save
 
 def colab_main():
-    """Main function for Google Colab operation"""
+    # Parse arguments
     parser = get_arguments()
+    opt = parser.parse_args([])  # Start with empty args
+    
+    print("Starting training...")
+    # Set default values for Colab
+    opt.not_cuda = not torch.cuda.is_available()  # Automatically determine CUDA availability
+    opt.niter = 2000
+    opt.min_size = 25
+    opt.max_size = 250
+    opt.mode = 'train'
+    opt.input_dir = 'Input/Images'
+    
+    # Initialize required values
+    opt.scale_factor = 0.75  # Default scale factor
+    opt.scale_factor_init = 0.75
+    opt.min_nfc = 32
+    opt.min_nfc_init = 32
+    opt.nfc = 32
+    opt.nfc_init = 32
+    opt.alpha = 10
+    opt.beta1 = 0.5
+    opt.nc_im = 3  # RGB image
+    opt.nc_z = 3   # Noise dimension
+    opt.noise_amp = 0.1
+    opt.noise_amp_init = 0.1
+    opt.ker_size = 3
+    opt.num_layer = 5
+    opt.padd_size = 0
+    opt.stride = 1
+    opt.gamma = 0.1
+    opt.lambda_grad = 0.1
+    opt.Gsteps = 3
+    opt.Dsteps = 3
+    opt.lr_g = 0.0005
+    opt.lr_d = 0.0005
+    opt.out = 'Output'
+    opt.manualSeed = None  # Will be set in post_config
+    
+    # Initialize directories
+    os.makedirs(opt.input_dir, exist_ok=True)
     
     if IN_COLAB:
-        print("Running in Google Colab")
-        print("1. First, let's upload an image for processing")
-        filename = upload_image('Input/Images')
-        
-        if filename is None:
-            print("No image was uploaded")
-            return
-        
-        # Set the image name in the arguments
-        args = parser.parse_args(['--input_name', filename])
+        # Handle image upload in Colab
+        uploaded = files.upload()
+        for filename in uploaded.keys():
+            # Save uploaded image to Input directory
+            input_path = os.path.join(opt.input_dir, filename)
+            with open(input_path, 'wb') as f:
+                f.write(uploaded[filename])
+            print(f"Uploaded {filename} to {opt.input_dir}")
+            opt.input_name = filename
+            break  # Just use the first uploaded image
     else:
-        # For non-Colab environments
-        args = parser.parse_args()
-        
-        if args.input_name is None:
-            print("Please provide an input image name with --input_name")
+        # Use a default image if not in Colab
+        test_images = os.listdir(opt.input_dir)
+        if test_images:
+            opt.input_name = test_images[0]
+            print(f"Using existing image: {opt.input_name}")
+        else:
+            print("No images found in Input/Images directory. Please add an image.")
             return
     
-    # Post-process the arguments
-    opt = post_config(args)
+    # Configure the model with post_config
+    opt = post_config(opt)
     
-    # Run the appropriate function based on the mode
-    if opt.mode == 'train':
-        print("Starting training...")
-        result = run_training(opt)
+    Gs = []
+    Zs = []
+    reals = []
+    NoiseAmp = []
+    dir2save = generate_dir2save(opt)
+    
+    try:
+        if os.path.exists(dir2save):
+            print("Loading pre-trained model...")
+            Gs, Zs, reals, NoiseAmp = load_trained_pyramid(opt)
+        else:
+            print("Training new model...")
+            try:
+                # First read the image and adjust scales
+                real_ = read_image(opt)
+                # This will set opt.scale1 and other scale-related parameters
+                real = adjust_scales2image(real_, opt)
+                # Now pass the pre-processed images to train
+                train(opt, Gs, Zs, reals, NoiseAmp, real_=real_, real=real)
+            except RuntimeError as e:
+                if "CUDA" in str(e):
+                    print("\nError: CUDA (GPU) operation failed. Switching to CPU mode.")
+                    opt.not_cuda = True
+                    opt.device = torch.device("cpu")
+                    # Try again with CPU
+                    real_ = read_image(opt)
+                    real = adjust_scales2image(real_, opt)
+                    train(opt, Gs, Zs, reals, NoiseAmp, real_=real_, real=real)
+                else:
+                    raise e
         
-        # Generate a random sample after training
-        if result is not None:
-            Gs, Zs, reals, NoiseAmp = result
-            print("Generating random samples...")
-            SinGAN_generate(Gs, Zs, reals, NoiseAmp, opt)
-        
-    elif opt.mode == 'random_samples':
+        # Generate a random sample
         print("Generating random samples...")
-        result_dir = run_random_samples(opt)
+        try:
+            SinGAN_generate(Gs, Zs, reals, NoiseAmp, opt)
+            print("Training and sample generation completed successfully!")
+        except Exception as e:
+            print(f"Warning: Sample generation failed: {str(e)}")
+            print("Training completed successfully, but sample generation failed.")
         
-        if result_dir is not None:
-            print(f"Random samples saved to {result_dir}")
-            display_images(result_dir)
-            
-    elif opt.mode == 'animation':
-        print("Generating animation...")
-        result_dir = run_animation(opt)
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
         
-        if result_dir is not None:
-            print(f"Animation saved to {result_dir}")
-            
-    elif opt.mode == 'harmonization':
-        print("For harmonization, we need a reference image and its mask")
-        ref_filename = upload_image('Input/Harmonization')
-        mask_filename = upload_image('Input/Harmonization')
-        
-        if ref_filename is None or mask_filename is None:
-            print("Reference image or mask was not uploaded")
-            return
-        
-        # Update the arguments
-        opt.ref_name = ref_filename
-        
-        print("Starting harmonization...")
-        result_dir = run_harmonization(opt)
-        
-        if result_dir is not None:
-            print(f"Harmonization result saved to {result_dir}")
-            display_images(result_dir)
-            
-    elif opt.mode == 'editing':
-        print("For editing, we need a reference image and its mask")
-        ref_filename = upload_image('Input/Editing')
-        mask_filename = upload_image('Input/Editing')
-        
-        if ref_filename is None or mask_filename is None:
-            print("Reference image or mask was not uploaded")
-            return
-        
-        # Update the arguments
-        opt.ref_name = ref_filename
-        opt.ref_dir = 'Input/Editing'
-        
-        print("Starting editing...")
-        result_dir = run_editing(opt)
-        
-        if result_dir is not None:
-            print(f"Editing result saved to {result_dir}")
-            display_images(result_dir)
-            
-    elif opt.mode == 'paint2image':
-        print("For paint to image, we need a paint image")
-        ref_filename = upload_image('Input/Paint')
-        
-        if ref_filename is None:
-            print("Paint image was not uploaded")
-            return
-        
-        # Update the arguments
-        opt.ref_name = ref_filename
-        opt.ref_dir = 'Input/Paint'
-        
-        print("Starting paint to image conversion...")
-        result_dir = run_paint2image(opt)
-        
-        if result_dir is not None:
-            print(f"Paint to image result saved to {result_dir}")
-            display_images(result_dir)
-            
-    elif opt.mode == 'SR':
-        print("Starting super resolution...")
-        result_dir = run_super_resolution(opt)
-        
-        if result_dir is not None:
-            print(f"Super resolution result saved to {result_dir}")
-            display_images(result_dir)
-            
-    else:
-        print(f"Unknown mode: {opt.mode}")
+    return opt, Gs, Zs, reals, NoiseAmp
 
 # Run the main function when the script is executed
 if __name__ == "__main__":
