@@ -1,0 +1,1 @@
+# SinGAN_major_Project
